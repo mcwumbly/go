@@ -282,7 +282,7 @@ type conn struct {
 	bufr *bufio.Reader
 
 	// bufw writes to checkConnErrorWriter{c}, which populates werr on error.
-	bufw *bufio.Writer
+	bufw bufioWriter
 
 	// lastMethod is the method of the most recent request
 	// on this connection, if any.
@@ -425,7 +425,7 @@ type response struct {
 	wants10KeepAlive bool               // HTTP/1.0 w/ Connection "keep-alive"
 	wantsClose       bool               // HTTP request has Connection "close"
 
-	w  *bufio.Writer // buffers output in chunks to chunkWriter
+	w  bufioWriter // buffers output in chunks to chunkWriter
 	cw chunkWriter
 
 	// handlerHeader is the Header that Handlers get access to,
@@ -797,11 +797,101 @@ func (cr *connReader) Read(p []byte) (n int, err error) {
 	return n, err
 }
 
+// SyncBufioWriterEnvVar is the name of an environment variable, when set to a
+// value that parses to true with strconv.ParseBool, will cause this package to
+// use a thread-safe version of bufio.Writer.
+// Please see golang/go#34902 for more information.
+const SyncBufioWriterEnvVar = "NET_HTTP_SERVER_SYNC_BUFIO_WRITER"
+
 var (
 	bufioReaderPool   sync.Pool
 	bufioWriter2kPool sync.Pool
 	bufioWriter4kPool sync.Pool
 )
+
+// bufioWriter is an interface for bufio.Writer and makes it trivial to replace
+// bufio.Writer with its thread-safe wrapper, syncBufioWriter.
+// Please see golang/go#34902 for more information.
+type bufioWriter interface {
+	Size() int
+	Reset(io.Writer)
+	Flush() error
+	Available() int
+	Buffered() int
+	Write([]byte) (int, error)
+	WriteByte(byte) error
+	WriteRune(rune) (int, error)
+	WriteString(string) (int, error)
+	ReadFrom(io.Reader) (int64, error)
+}
+
+// syncBufioWriter is a wrapper around bufio.Writer and is used to avoid
+// data races that occur when 100-continue is sent.
+// Please see golang/go#34902 for more information.
+type syncBufioWriter struct {
+	sync.Mutex
+	bufio.Writer
+}
+
+func (b *syncBufioWriter) Size() int {
+	b.Lock()
+	defer b.Unlock()
+	return b.Writer.Size()
+}
+
+func (b *syncBufioWriter) Reset(w io.Writer) {
+	b.Lock()
+	defer b.Unlock()
+	b.Writer.Reset(w)
+}
+
+func (b *syncBufioWriter) Flush() error {
+	b.Lock()
+	defer b.Unlock()
+	return b.Writer.Flush()
+}
+
+func (b *syncBufioWriter) Available() int {
+	b.Lock()
+	defer b.Unlock()
+	return b.Writer.Available()
+}
+
+func (b *syncBufioWriter) Buffered() int {
+	b.Lock()
+	defer b.Unlock()
+	return b.Writer.Buffered()
+}
+
+func (b *syncBufioWriter) Write(p []byte) (int, error) {
+	b.Lock()
+	defer b.Unlock()
+	return b.Writer.Write(p)
+}
+
+func (b *syncBufioWriter) WriteByte(c byte) error {
+	b.Lock()
+	defer b.Unlock()
+	return b.Writer.WriteByte(c)
+}
+
+func (b *syncBufioWriter) WriteRune(r rune) (int, error) {
+	b.Lock()
+	defer b.Unlock()
+	return b.Writer.WriteRune(r)
+}
+
+func (b *syncBufioWriter) WriteString(s string) (int, error) {
+	b.Lock()
+	defer b.Unlock()
+	return b.Writer.WriteString(s)
+}
+
+func (b *syncBufioWriter) ReadFrom(r io.Reader) (int64, error) {
+	b.Lock()
+	defer b.Unlock()
+	return b.Writer.ReadFrom(r)
+}
 
 var copyBufPool = sync.Pool{
 	New: func() interface{} {
@@ -836,19 +926,34 @@ func putBufioReader(br *bufio.Reader) {
 	bufioReaderPool.Put(br)
 }
 
-func newBufioWriterSize(w io.Writer, size int) *bufio.Writer {
+// newBufioWriterSize returns a new bufffered write or one from a pool.
+// The returned writer may or may not be thread-safe, depending on the value
+// of the environment variable SyncBufioWriterEnvVar. However, changing the
+// value of the environment variable will have no effect on writers that have
+// already been added to the pool.
+func newBufioWriterSize(w io.Writer, size int) bufioWriter {
 	pool := bufioWriterPool(size)
 	if pool != nil {
 		if v := pool.Get(); v != nil {
-			bw := v.(*bufio.Writer)
+			bw := v.(bufioWriter)
 			bw.Reset(w)
 			return bw
 		}
 	}
-	return bufio.NewWriterSize(w, size)
+	bw := bufio.NewWriterSize(w, size)
+
+	// If the value of the environment variable SyncBufioWriterEnvVar is true
+	// according to strconv.ParseBool, then the buffered writer is returned in
+	// a thread-safe wrapper.
+	if val, ok := os.LookupEnv(SyncBufioWriterEnvVar); ok {
+		if ok, _ := strconv.ParseBool(val); ok {
+			return &syncBufioWriter{Writer: *bw}
+		}
+	}
+	return bw
 }
 
-func putBufioWriter(bw *bufio.Writer) {
+func putBufioWriter(bw bufioWriter) {
 	bw.Reset(nil)
 	if pool := bufioWriterPool(bw.Available()); pool != nil {
 		pool.Put(bw)
@@ -877,7 +982,16 @@ type expectContinueReader struct {
 	resp       *response
 	readCloser io.ReadCloser
 	closed     bool
-	sawEOF     bool
+	chanSawEOF chan struct{}
+}
+
+func (ecr *expectContinueReader) sawEOF() bool {
+	select {
+	case <-ecr.chanSawEOF:
+		return true
+	default:
+		return false
+	}
 }
 
 func (ecr *expectContinueReader) Read(p []byte) (n int, err error) {
@@ -890,8 +1004,8 @@ func (ecr *expectContinueReader) Read(p []byte) (n int, err error) {
 		ecr.resp.conn.bufw.Flush()
 	}
 	n, err = ecr.readCloser.Read(p)
-	if err == io.EOF {
-		ecr.sawEOF = true
+	if err == io.EOF && !ecr.sawEOF() {
+		close(ecr.chanSawEOF)
 	}
 	return
 }
@@ -1170,7 +1284,7 @@ var (
 // This method has a value receiver, despite the somewhat large size
 // of h, because it prevents an allocation. The escape analysis isn't
 // smart enough to realize this function doesn't mutate h.
-func (h extraHeader) Write(w *bufio.Writer) {
+func (h extraHeader) Write(w bufioWriter) {
 	if h.date != nil {
 		w.Write(headerDate)
 		w.Write(h.date)
@@ -1310,7 +1424,7 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 	// because we don't know if the next bytes on the wire will be
 	// the body-following-the-timer or the subsequent request.
 	// See Issue 11549.
-	if ecr, ok := w.req.Body.(*expectContinueReader); ok && !ecr.sawEOF {
+	if ecr, ok := w.req.Body.(*expectContinueReader); ok && !ecr.sawEOF() {
 		w.closeAfterReply = true
 	}
 
@@ -1483,7 +1597,7 @@ func foreachHeaderElement(v string, fn func(string)) {
 // to bw. is11 is whether the HTTP request is HTTP/1.1. false means HTTP/1.0.
 // code is the response status code.
 // scratch is an optional scratch buffer. If it has at least capacity 3, it's used.
-func writeStatusLine(bw *bufio.Writer, is11 bool, code int, scratch []byte) {
+func writeStatusLine(bw bufioWriter, is11 bool, code int, scratch []byte) {
 	if is11 {
 		bw.WriteString("HTTP/1.1 ")
 	} else {
@@ -1870,7 +1984,11 @@ func (c *conn) serve(ctx context.Context) {
 		if req.expectsContinue() {
 			if req.ProtoAtLeast(1, 1) && req.ContentLength != 0 {
 				// Wrap the Body reader with one that replies on the connection
-				req.Body = &expectContinueReader{readCloser: req.Body, resp: w}
+				req.Body = &expectContinueReader{
+					chanSawEOF: make(chan struct{}),
+					readCloser: req.Body,
+					resp:       w,
+				}
 			}
 		} else if req.Header.get("Expect") != "" {
 			w.sendExpectationFailed()
