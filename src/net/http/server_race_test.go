@@ -56,6 +56,11 @@ func TestExpectedContinueRace(t *testing.T) {
 		// requests with no remainder, then a message is emitted.
 		// This prevents the screen from being cluttered with output.
 		printSuccessEveryN = uint64(1000)
+
+		// expectContinueTimeout is used by the http.Transport of the reverse proxy.
+		// In the default transport it is set to 1 second. Setting it to a lower
+		// value or 0 reproduces race conditions observed more quickly.
+		expectContinueTimeout = 10 * time.Millisecond
 	)
 
 	var (
@@ -80,6 +85,8 @@ func TestExpectedContinueRace(t *testing.T) {
 
 	backendURL, _ := url.Parse(cst.URL)
 	rpxy := httputil.NewSingleHostReverseProxy(backendURL)
+	rpxy.Transport = http.DefaultTransport
+	rpxy.Transport.(*http.Transport).ExpectContinueTimeout = expectContinueTimeout
 	addr := ln.Addr().String()
 
 	// Start the web server.
