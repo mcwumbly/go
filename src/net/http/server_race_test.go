@@ -49,7 +49,16 @@ import (
 func TestExpectedContinueRace(t *testing.T) {
 	const (
 		concurrentClients = 10
-		httpResponseValue = "this call was relayed by the reverse proxy"
+
+		// Request needs a larger body to see the error happen more quickly.
+		// It is reproducible with smaller body sizes, but it takes longer to
+		// fail
+		httpRequestSize = 4096
+
+		// Response needs a larger body to increase the odds of seeing an
+		// error related to the expect continue response header being written after
+		// the response body has partially been flushed.
+		httpResponseSize = 10240
 
 		// printSuccessEveryN is used to determine when a "success" message is
 		// printed. If printSuccessEveryN is divided into the total number of
@@ -60,20 +69,22 @@ func TestExpectedContinueRace(t *testing.T) {
 		// expectContinueTimeout is used by the http.Transport of the reverse proxy.
 		// In the default transport it is set to 1 second. Setting it to a lower
 		// value or 0 reproduces race conditions observed more quickly.
-		expectContinueTimeout = 10 * time.Millisecond
+		proxyExpectContinueTimeout = 10 * time.Millisecond
 	)
 
 	var (
-		requestCounter uint64
-		started        = time.Now()
-		activeClients  sync.WaitGroup
+		requestCounter         uint64
+		started                = time.Now()
+		activeClients          sync.WaitGroup
+		httpRequestBodyString  = strings.Repeat("r", httpRequestSize)
+		httpResponseBodyString = strings.Repeat("w", httpResponseSize)
 	)
 
 	// Track when the clients are no longer active.
 	activeClients.Add(concurrentClients)
 
 	cst := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, httpResponseValue)
+		fmt.Fprint(w, httpResponseBodyString)
 	}))
 	defer cst.Close()
 
@@ -86,7 +97,7 @@ func TestExpectedContinueRace(t *testing.T) {
 	backendURL, _ := url.Parse(cst.URL)
 	rpxy := httputil.NewSingleHostReverseProxy(backendURL)
 	rpxy.Transport = http.DefaultTransport
-	rpxy.Transport.(*http.Transport).ExpectContinueTimeout = expectContinueTimeout
+	rpxy.Transport.(*http.Transport).ExpectContinueTimeout = proxyExpectContinueTimeout
 	addr := ln.Addr().String()
 
 	// Start the web server.
@@ -124,11 +135,6 @@ func TestExpectedContinueRace(t *testing.T) {
 		var (
 			client = &http.Client{}
 			url    = "http://" + addr
-
-			// Request needs a larger body to see the error happen more quickly.
-			// It is reproducable with smaller body sizes, but it takes longer to
-			// fail
-			bodyString = strings.Repeat("a", 4096)
 		)
 
 		doRequest := func(req *http.Request) {
@@ -141,7 +147,7 @@ func TestExpectedContinueRace(t *testing.T) {
 			defer resp.Body.Close()
 			if text, err := ioutil.ReadAll(resp.Body); err != nil {
 				print(reqNum, "failed to read response: %s", err)
-			} else if string(text) != httpResponseValue {
+			} else if string(text) != httpResponseBodyString {
 				print(reqNum, "unexpected response: %s", text)
 			} else {
 				if reqNum%printSuccessEveryN == 0 {
@@ -158,7 +164,7 @@ func TestExpectedContinueRace(t *testing.T) {
 					case <-ctx.Done():
 						return
 					default:
-						buf := bytes.NewBufferString(bodyString)
+						buf := bytes.NewBufferString(httpRequestBodyString)
 						req, _ := http.NewRequest("POST", url, buf)
 						req.Header.Add("Expect", "100-continue")
 						doRequest(req)

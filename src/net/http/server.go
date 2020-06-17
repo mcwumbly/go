@@ -1005,7 +1005,12 @@ func (ecr *expectContinueReader) Read(p []byte) (n int, err error) {
 		ecr.resp.wroteContinue = true
 		ecr.resp.conn.mubufw.Lock()
 		defer ecr.resp.conn.mubufw.Unlock()
-		if ecr.resp.conn.bufw != nil {
+
+		// check that bufw isn't getting removed out from underneath us by finalFlush
+		// also check that the response hasn't been partially written already
+		// note: this check is imperfect as buffered will return 0 bytes immediately
+		// after a flush and before additional bytes have been written
+		if ecr.resp.conn.bufw != nil && ecr.resp.conn.bufw.Buffered() == 0 {
 			ecr.resp.conn.bufw.WriteString("HTTP/1.1 100 Continue\r\n\r\n")
 			ecr.resp.conn.bufw.Flush()
 		}
