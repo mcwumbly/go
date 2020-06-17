@@ -284,6 +284,9 @@ type conn struct {
 	// bufw writes to checkConnErrorWriter{c}, which populates werr on error.
 	bufw bufioWriter
 
+	// mubufw guards against bufw access and assignment
+	mubufw sync.Mutex
+
 	// lastMethod is the method of the most recent request
 	// on this connection, if any.
 	lastMethod string
@@ -1000,8 +1003,12 @@ func (ecr *expectContinueReader) Read(p []byte) (n int, err error) {
 	}
 	if !ecr.resp.wroteContinue && !ecr.resp.conn.hijacked() {
 		ecr.resp.wroteContinue = true
-		ecr.resp.conn.bufw.WriteString("HTTP/1.1 100 Continue\r\n\r\n")
-		ecr.resp.conn.bufw.Flush()
+		ecr.resp.conn.mubufw.Lock()
+		defer ecr.resp.conn.mubufw.Unlock()
+		if ecr.resp.conn.bufw != nil {
+			ecr.resp.conn.bufw.WriteString("HTTP/1.1 100 Continue\r\n\r\n")
+			ecr.resp.conn.bufw.Flush()
+		}
 	}
 	n, err = ecr.readCloser.Read(p)
 	if err == io.EOF && !ecr.sawEOF() {
@@ -1768,6 +1775,8 @@ func (c *conn) finalFlush() {
 	}
 
 	if c.bufw != nil {
+		c.mubufw.Lock()
+		defer c.mubufw.Unlock()
 		c.bufw.Flush()
 		// Steal the bufio.Writer (~4KB worth of memory) and its associated
 		// writer for a future connection.
